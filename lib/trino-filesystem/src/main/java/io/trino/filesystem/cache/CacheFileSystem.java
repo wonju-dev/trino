@@ -13,6 +13,7 @@
  */
 package io.trino.filesystem.cache;
 
+import com.google.common.collect.ImmutableList;
 import io.airlift.units.Duration;
 import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
@@ -21,11 +22,13 @@ import io.trino.filesystem.TrinoInputFile;
 import io.trino.filesystem.TrinoOutputFile;
 import io.trino.filesystem.UriLocation;
 import io.trino.filesystem.encryption.EncryptionKey;
+import io.trino.spi.cache.BlobCache;
+import io.trino.spi.cache.CacheKey;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
@@ -36,10 +39,10 @@ public final class CacheFileSystem
         implements TrinoFileSystem
 {
     private final TrinoFileSystem delegate;
-    private final TrinoFileSystemCache cache;
+    private final BlobCache cache;
     private final CacheKeyProvider keyProvider;
 
-    public CacheFileSystem(TrinoFileSystem delegate, TrinoFileSystemCache cache, CacheKeyProvider keyProvider)
+    public CacheFileSystem(TrinoFileSystem delegate, BlobCache cache, CacheKeyProvider keyProvider)
     {
         this.delegate = requireNonNull(delegate, "delegate is null");
         this.cache = requireNonNull(cache, "cache is null");
@@ -85,52 +88,56 @@ public final class CacheFileSystem
     @Override
     public TrinoOutputFile newOutputFile(Location location)
     {
-        TrinoOutputFile output = delegate.newOutputFile(location);
-        try {
-            cache.expire(location);
-        }
-        catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        return output;
+        // Invalidation must follow the write, not precede it: a concurrent read during the
+        // write could otherwise repopulate the entry with the previous content
+        return new CacheOutputFile(delegate.newOutputFile(location), () -> invalidate(location));
     }
 
     @Override
     public TrinoOutputFile newEncryptedOutputFile(Location location, EncryptionKey key)
     {
-        TrinoOutputFile output = delegate.newEncryptedOutputFile(location, key);
-        try {
-            cache.expire(location);
-        }
-        catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        return output;
+        return new CacheOutputFile(delegate.newEncryptedOutputFile(location, key), () -> invalidate(location));
     }
 
     @Override
     public void deleteFile(Location location)
             throws IOException
     {
-        delegate.deleteFile(location);
-        cache.expire(location);
+        try {
+            delegate.deleteFile(location);
+        }
+        finally {
+            // Invalidate even when the delete fails: it may have partially taken effect
+            invalidate(location);
+        }
     }
 
     @Override
     public void deleteDirectory(Location location)
             throws IOException
     {
-        delegate.deleteDirectory(location);
-        cache.expire(location);
+        // Entries must be enumerated while the files still exist; a listing failure fails the
+        // operation before anything is mutated, so the cache stays consistent with storage
+        List<CacheKey> keys = directoryKeys(location);
+        try {
+            delegate.deleteDirectory(location);
+        }
+        finally {
+            keys.forEach(cache::invalidate);
+        }
     }
 
     @Override
     public void renameFile(Location source, Location target)
             throws IOException
     {
-        delegate.renameFile(source, target);
-        cache.expire(source);
-        cache.expire(target);
+        try {
+            delegate.renameFile(source, target);
+        }
+        finally {
+            invalidate(source);
+            invalidate(target);
+        }
     }
 
     @Override
@@ -165,7 +172,16 @@ public final class CacheFileSystem
     public void renameDirectory(Location source, Location target)
             throws IOException
     {
-        delegate.renameDirectory(source, target);
+        List<CacheKey> keys = ImmutableList.<CacheKey>builder()
+                .addAll(directoryKeys(source))
+                .addAll(directoryKeys(target))
+                .build();
+        try {
+            delegate.renameDirectory(source, target);
+        }
+        finally {
+            keys.forEach(cache::invalidate);
+        }
     }
 
     @Override
@@ -186,8 +202,29 @@ public final class CacheFileSystem
     public void deleteFiles(Collection<Location> locations)
             throws IOException
     {
-        delegate.deleteFiles(locations);
-        cache.expire(locations);
+        try {
+            delegate.deleteFiles(locations);
+        }
+        finally {
+            // Invalidate even when the delete fails: it may have partially taken effect
+            locations.forEach(this::invalidate);
+        }
+    }
+
+    private void invalidate(Location location)
+    {
+        keyProvider.getCacheKeyPrefix(location).ifPresent(cache::invalidate);
+    }
+
+    private List<CacheKey> directoryKeys(Location location)
+            throws IOException
+    {
+        ImmutableList.Builder<CacheKey> keys = ImmutableList.builder();
+        FileIterator iterator = delegate.listFiles(location);
+        while (iterator.hasNext()) {
+            keyProvider.getCacheKeyPrefix(iterator.next().location()).ifPresent(keys::add);
+        }
+        return keys.build();
     }
 
     @Override

@@ -51,7 +51,8 @@ final class AlluxioBlob
         this.description = delegate.toString();
         this.length = requireNonNull(status, "status is null").getLength();
         this.statistics = requireNonNull(statistics, "statistics is null");
-        this.helper = new AlluxioInputHelper(tracer, description, cacheKey, status, cacheManager, configuration, statistics);
+        // Positioned reads are already correctly sized by the caller, so skip the small-read buffer
+        this.helper = new AlluxioInputHelper(tracer, description, cacheKey, status, cacheManager, configuration, statistics, false);
     }
 
     @Override

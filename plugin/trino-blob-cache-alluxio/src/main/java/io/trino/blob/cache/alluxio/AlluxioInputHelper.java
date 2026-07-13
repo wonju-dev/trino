@@ -64,7 +64,8 @@ public class AlluxioInputHelper
             URIStatus status,
             CacheManager cacheManager,
             AlluxioConfiguration configuration,
-            AlluxioCacheStats statistics)
+            AlluxioCacheStats statistics,
+            boolean bufferSmallReads)
     {
         this.tracer = requireNonNull(tracer, "tracer is null");
         this.status = requireNonNull(status, "status is null");
@@ -74,9 +75,10 @@ public class AlluxioInputHelper
         this.pageSize = (int) requireNonNull(configuration, "configuration is null").getBytes(PropertyKey.USER_CLIENT_CACHE_PAGE_SIZE);
         this.statistics = requireNonNull(statistics, "statistics is null");
         this.location = requireNonNull(location, "location is null");
-        // Buffer to reduce the cost of doing page aligned reads for small sequential reads pattern
         this.bufferSize = pageSize;
-        this.readBuffer = new byte[bufferSize];
+        // Buffer to reduce the cost of page aligned reads for small sequential reads. Positioned reads
+        // are already correctly sized by the caller, so they skip the buffer and avoid its per-input cost.
+        this.readBuffer = bufferSmallReads ? new byte[bufferSize] : null;
     }
 
     public int doCacheRead(long position, byte[] bytes, int offset, int length)
@@ -99,7 +101,7 @@ public class AlluxioInputHelper
         if (length == 0) {
             return 0;
         }
-        if (position < bufferStartPosition || position >= bufferEndPosition) {
+        if (readBuffer == null || position < bufferStartPosition || position >= bufferEndPosition) {
             return 0;
         }
         int bytesToCopy = min(length, Ints.saturatedCast(bufferEndPosition - position));
@@ -141,7 +143,7 @@ public class AlluxioInputHelper
         }
         CacheContext cacheContext = status.getCacheContext();
         PageId pageId = new PageId(cacheContext.getCacheIdentifier(), currentPage);
-        if (bytesLeftInPage > length && bufferSize > length) { // Read page into buffer
+        if (readBuffer != null && bytesLeftInPage > length && bufferSize > length) { // Read page into buffer
             int putBytes = putBuffer(currentPageOffset, pageId, cacheContext);
             if (putBytes <= 0) {
                 return putBytes;

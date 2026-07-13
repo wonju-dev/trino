@@ -11,7 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.trino.filesystem.memory;
+package io.trino.blob.cache.memory;
 
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
@@ -23,35 +23,42 @@ import io.trino.filesystem.TrinoInputFile;
 import io.trino.filesystem.cache.CacheFileSystem;
 import io.trino.filesystem.cache.CacheKeyProvider;
 import io.trino.filesystem.cache.DefaultCacheKeyProvider;
+import io.trino.filesystem.memory.MemoryFileSystem;
+import io.trino.spi.cache.Blob;
+import io.trino.spi.cache.BlobSource;
+import io.trino.spi.cache.CacheKey;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.UUID;
 
+import static java.lang.Math.min;
+import static java.lang.Math.toIntExact;
 import static java.util.concurrent.TimeUnit.HOURS;
 import static org.assertj.core.api.Assertions.assertThat;
 
-public class TestMemoryFileSystemCache
+public class TestMemoryBlobCache
         extends AbstractTestTrinoFileSystem
 {
     private static final int MAX_CONTENT_LENGTH = 2 * 1024 * 1024;
 
     private MemoryFileSystem delegate;
     private CacheFileSystem fileSystem;
-    private MemoryFileSystemCache cache;
+    private MemoryBlobCache cache;
     private CacheKeyProvider cacheKeyProvider;
 
     @BeforeAll
     void beforeAll()
     {
-        MemoryFileSystemCacheConfig configuration = new MemoryFileSystemCacheConfig()
+        MemoryBlobCacheConfig configuration = new MemoryBlobCacheConfig()
                 .setMaxContentLength(DataSize.ofBytes(MAX_CONTENT_LENGTH))
                 .setCacheTtl(new Duration(8, HOURS));
         delegate = new MemoryFileSystem();
-        cache = new MemoryFileSystemCache(configuration);
+        cache = new MemoryBlobCache(configuration);
         cacheKeyProvider = new DefaultCacheKeyProvider();
         fileSystem = new CacheFileSystem(delegate, cache, cacheKeyProvider);
     }
@@ -103,6 +110,79 @@ public class TestMemoryFileSystemCache
         }
         assertThat(cache.isCached(cacheKeyProvider.getCacheKey(inputFile).orElseThrow())).isTrue();
         getFileSystem().deleteFile(location);
+    }
+
+    @Test
+    public void testLengthHintMismatch()
+            throws IOException
+    {
+        byte[] content = new byte[100];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) i;
+        }
+        MemoryBlobCache cache = new MemoryBlobCache(new MemoryBlobCacheConfig());
+
+        // length hint understates the storage object: the entry must serve the object's head,
+        // not tail-anchored bytes shifted by the difference
+        try (Blob blob = cache.get(CacheKey.of("understated"), new TestingBlobSource(content, 90))) {
+            assertThat(blob.length()).isEqualTo(90);
+            byte[] buffer = new byte[90];
+            blob.read(0, buffer, 0, buffer.length);
+            assertThat(buffer).isEqualTo(Arrays.copyOf(content, 90));
+        }
+
+        // length hint overstates the storage object: the whole object is cached, anchored at 0
+        try (Blob blob = cache.get(CacheKey.of("overstated"), new TestingBlobSource(content, 110))) {
+            assertThat(blob.length()).isEqualTo(100);
+            byte[] buffer = new byte[100];
+            blob.read(0, buffer, 0, buffer.length);
+            assertThat(buffer).isEqualTo(content);
+        }
+
+        // exact length
+        try (Blob blob = cache.get(CacheKey.of("exact"), new TestingBlobSource(content, 100))) {
+            assertThat(blob.length()).isEqualTo(100);
+            byte[] buffer = new byte[100];
+            blob.read(0, buffer, 0, buffer.length);
+            assertThat(buffer).isEqualTo(content);
+        }
+    }
+
+    private static class TestingBlobSource
+            implements BlobSource
+    {
+        private final byte[] content;
+        private final long reportedLength;
+
+        public TestingBlobSource(byte[] content, long reportedLength)
+        {
+            this.content = content;
+            this.reportedLength = reportedLength;
+        }
+
+        @Override
+        public long length()
+        {
+            return reportedLength;
+        }
+
+        @Override
+        public void readFully(long position, byte[] buffer, int offset, int length)
+                throws IOException
+        {
+            if (position < 0 || position > content.length - length) {
+                throw new EOFException("Cannot read %s bytes at %s of %s".formatted(length, position, content.length));
+            }
+            System.arraycopy(content, toIntExact(position), buffer, offset, length);
+        }
+
+        @Override
+        public int readTail(byte[] buffer, int offset, int length)
+        {
+            int readSize = min(length, content.length);
+            System.arraycopy(content, content.length - readSize, buffer, offset, readSize);
+            return readSize;
+        }
     }
 
     private Location writeFile(int fileSize)
